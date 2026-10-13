@@ -30,6 +30,39 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 MIN_REAL_PAIRS = 10
 
+# Must exactly replicate extract.py's dyad_id_for_path/stem_for_segments: for
+# Seamless-style filenames the base id is just the lowercased stem, but for
+# everything else (original_vc/emotivoice_tts/emotivoice_tts_vc all reuse
+# generic filenames like "speaker1_track.wav" across thousands of different
+# dyads) extract.py disambiguates with stem + a short hash of the resolved
+# absolute path. The embed index (build_embed_index, below) is built by
+# scanning those on-disk filenames, so lookups here must compute the same
+# base id or every non-Seamless row silently resolves to the wrong embedding
+# (or, since those rows all collide on "speaker1_track", to none at all --
+# this was the actual bug: a plain .stem.lower() made every augmented-variant
+# row miss the index, while coincidentally Seamless "original" rows still
+# matched, silently dropping ~75% of rows from any accuracy computed here).
+_DYAD_RE = re.compile(r"V\d+_(S\d+)_I(\d+)_P[\w\d]+", re.I)
+
+
+def _short_hash(s: str, n: int = 10) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:n]
+
+
+def _file_uid(wav_path: Path) -> str:
+    try:
+        resolved = wav_path.resolve()
+    except Exception:
+        resolved = wav_path
+    return f"{wav_path.stem.lower()}_{_short_hash(str(resolved))}"
+
+
+def stem_for_segments(wav_path: Path) -> str:
+    if _DYAD_RE.match(wav_path.stem):
+        return wav_path.stem.lower()
+    return _file_uid(wav_path)
+
+
 _CHUNK_RE = re.compile(
     r"(?P<base>.+?)(?P<tag>(?:__ch|_ch|__chunk|_chunk))(?P<idx>\d+)$",
     re.IGNORECASE,
@@ -756,10 +789,21 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device) -> Tuple[nn
     if model_type == "transformer":
         model_type = "llama"
 
+    # mlp/logreg have no audio encoder submodule at all (they masked-mean-pool
+    # the raw embeddings directly into head/linear), so their "input dim" has
+    # to be read off head.0.weight / linear.weight instead -- and, when aux
+    # features are concatenated in, that weight's input dim is
+    # d_in_audio + 3*aux_dim, not d_in_audio alone, so aux must be detected
+    # here (not just in the use_aux block below) to subtract it back out.
+    _use_aux_early = any(k.startswith("aux.") for k in sd.keys())
+    _aux_dim_early = int(hp.get("aux_dim", 128))
+
     if model_type == "crossattn":
         proj_key = "audio_encoder.input_proj.weight"
     elif model_type == "base_transformer":
         proj_key = "audio.in_proj.weight"
+    elif model_type in ("mlp", "logreg"):
+        proj_key = "head.0.weight" if model_type == "mlp" else "linear.weight"
     else:
         proj_key = "audio.input_proj.weight"
 
@@ -769,8 +813,13 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device) -> Tuple[nn
             f"Available keys (first 20): {list(sd.keys())[:20]}"
         )
 
-    audio_d_model = int(sd[proj_key].shape[0])
-    d_in_audio    = int(sd[proj_key].shape[1])
+    if model_type in ("mlp", "logreg"):
+        fusion_in = int(sd[proj_key].shape[1])
+        d_in_audio = fusion_in - (3 * _aux_dim_early if _use_aux_early else 0)
+        audio_d_model = d_in_audio  # unused by these models; kept for the info dict
+    else:
+        audio_d_model = int(sd[proj_key].shape[0])
+        d_in_audio    = int(sd[proj_key].shape[1])
 
     dropout       = float(hp.get("dropout", 0.1))
     num_layers    = int(hp.get("num_layers", 6))
@@ -986,8 +1035,8 @@ def predict_csv(
     for row_idx, r in rows:
         p1_raw = r.get(p1_col, "") or ""
         p2_raw = r.get(p2_col, "") or ""
-        a = Path(p1_raw).stem.lower()
-        b = Path(p2_raw).stem.lower()
+        a = stem_for_segments(Path(p1_raw)) if p1_raw else ""
+        b = stem_for_segments(Path(p2_raw)) if p2_raw else ""
 
         aug_type    = _safe_str(r.get(aug_type_col, ""))
         rel_detail  = _safe_str(r.get(rel_detail_col, ""))
