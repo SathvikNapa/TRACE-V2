@@ -4,16 +4,32 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
 #SBATCH --account=a100acct
-#SBATCH --array=0-15
+#SBATCH --array=0-15%4
 #SBATCH --output=/export/fs05/snapaug1/naturalness_experiments/naturalness_runs/TRACE_V2_e0_strict/slurm_%A_%a.out
 
 # E0 completion: 4 baselines x 4 feature variants = 16 jobs on the strict_v2
 # split, one per array task. Mirrors sweep_ablation.sh's exact hyperparameters
 # (the ones that produced the legacy_v1 16-cell reference table).
+#
+# Lessons from the first (cancelled) attempt at this array:
+#  - num-workers 0 (copied from sweep_ablation.sh) meant the 16 requested
+#    CPUs sat idle while one thread did all data loading synchronously --
+#    batches took 40min-20+hrs. Now --num-workers 8, matching cpus-per-task.
+#  - Each task previously got its OWN cache dir and all 16 ran concurrently
+#    across different nodes, so all 16 redundantly rebuilt the full
+#    per-speaker embedding cache from scratch at once, ~16x the NFS load of
+#    the legacy sweep (which ran sequentially in one job, one shared cache).
+#    Now all tasks share ONE cache dir on NFS (survives across nodes, unlike
+#    node-local /tmp) so later tasks reuse what earlier ones already built.
+#    train.py's _atomic_npy_save + _acquire_lock already handle concurrent
+#    writers to the same cache safely (PID-suffixed tmp file + rename, with
+#    a lock around the write) -- this is a supported pattern, not a hack.
+#  - %4 throttles the array to 4 concurrent tasks instead of all 16 at once,
+#    bounding how hard this hits NFS while still getting real parallelism.
 set -euo pipefail
 
 PY=/home/snapaug1/spear/spear_venv/bin/python3
@@ -67,8 +83,8 @@ torchrun --nproc_per_node=1 "$SCRIPT" \
   --test-csv    "${SPLIT_DIR}/test.csv" \
   --embed-root  "$EMBED_ROOT" \
   --index-cache "$SHARED_INDEX" \
-  --cache-mode  speaker --cache-dtype float16 --num-workers 0 --cache-items 2048 \
-  --cache-root  "/tmp/snapaug1/e0_strict_cache_${SLURM_ARRAY_TASK_ID}" \
+  --cache-mode  speaker --cache-dtype float16 --num-workers 8 --cache-items 2048 \
+  --cache-root  "${OUT_BASE}/_shared_cache" \
   --max-seq-len 512 \
   --text-model  sentence-transformers/all-MiniLM-L6-v2 --prebuild-text \
   --text-batch-size 64 --text-max-len 256 --text-fp16 \
