@@ -6,14 +6,28 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=a100acct
 #SBATCH --array=0-15%4
 #SBATCH --output=/export/fs05/snapaug1/naturalness_experiments/naturalness_runs/TRACE_V2_e0_strict/slurm_%A_%a.out
 
 # E0 completion: 4 baselines x 4 feature variants = 16 jobs on the strict_v2
-# split, one per array task. Mirrors sweep_ablation.sh's exact hyperparameters
-# (the ones that produced the legacy_v1 16-cell reference table).
+# split, one per array task.
+#
+# IMPORTANT hyperparameter correction (after a second, wrong attempt at this
+# array): batch_size/num_epochs below were originally copied from
+# sweep_ablation.sh's CURRENT contents (1024/25, 512/15, 512/15, 256/15), but
+# that does NOT match what actually produced the legacy_v1 reference numbers
+# on disk -- read directly from each variant's hyperparams.json, the real
+# values are mlp=512/50, dyadformer=256/30, trace_latefusion=256/30,
+# trace_crossencoder=128/30 (sweep_ablation.sh must have been edited after
+# that run). Running with the wrong (smaller-batch... no, LARGER batch, FEWER
+# epochs) config gave ~4x fewer gradient steps than the working recipe, which
+# collapsed trace_latefusion/trace_crossencoder to degenerate majority-class
+# prediction on every feature variant while the simpler dyadformer baseline
+# still found a real solution -- NOT evidence of speaker-identity leakage,
+# just severe undertraining of the harder-to-optimize models. Fixed below to
+# match the actual hyperparams.json values.
 #
 # Lessons from the first (cancelled) attempt at this array:
 #  - num-workers 0 (copied from sweep_ablation.sh) meant the 16 requested
@@ -53,10 +67,10 @@ VARIANT_FLAGS[speech_context_rel]=""
 LABELS=(mlp dyadformer trace_latefusion trace_crossencoder)
 MODEL_TYPES=(mlp base_transformer llama crossattn)
 EXTRA_ARGS=(
-  "--batch-size 1024 --num-epochs 25"
-  "--batch-size 512  --num-epochs 15"
-  "--batch-size 512  --num-epochs 15"
-  "--batch-size 256  --num-epochs 15 --crossattn-layers 2"
+  "--batch-size 512  --num-epochs 50"
+  "--batch-size 256  --num-epochs 30"
+  "--batch-size 256  --num-epochs 30"
+  "--batch-size 128  --num-epochs 30 --crossattn-layers 2"
 )
 
 variant_idx=$(( SLURM_ARRAY_TASK_ID / 4 ))
